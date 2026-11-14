@@ -124,6 +124,11 @@ jobs:
           CONFIG_PACKAGE_luci=y
           CONFIG_PACKAGE_kmod-zram=y
           CONFIG_PACKAGE_zram-swap=y
+
+          # OpenClash kernel modules; install OpenClash LuCI package separately.
+          CONFIG_PACKAGE_kmod-tun=y
+          CONFIG_PACKAGE_kmod-inet-diag=y
+          CONFIG_PACKAGE_kmod-nft-tproxy=y
           EOF
 
           # OpenWrt top-level kernel options, not raw Linux Kconfig entries.
