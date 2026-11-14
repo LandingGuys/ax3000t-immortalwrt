@@ -140,9 +140,16 @@ jobs:
           echo "===== ZRAM CONFIG ====="
           grep -E '^CONFIG_(PACKAGE_(kmod-zram|zram-swap)|KERNEL_ZRAM_)' .config
           echo "===== OPENCLASH KERNEL DEPENDENCIES ====="
-          grep -E '^CONFIG_PACKAGE_kmod-(tun|inet-diag|nft-tproxy)=y          grep -q '^CONFIG_TARGET_mediatek_filogic_DEVICE_xiaomi_mi-router-ax3000t=y$' .config
+          grep -E '^CONFIG_PACKAGE_kmod-(tun|inet-diag|nft-tproxy)=y$' .config
+
+          grep -q '^CONFIG_TARGET_mediatek_filogic_DEVICE_xiaomi_mi-router-ax3000t=y$' .config
           grep -q '^CONFIG_PACKAGE_kmod-zram=y$' .config
-          grep -q '^CONFIG_PACKAGE_zram-swap=y          grep -q '^CONFIG_KERNEL_ZRAM_BACKEND_ZSTD=y$' .config
+          grep -q '^CONFIG_PACKAGE_zram-swap=y$' .config
+          grep -q '^CONFIG_PACKAGE_kmod-tun=y$' .config
+          grep -q '^CONFIG_PACKAGE_kmod-inet-diag=y$' .config
+          grep -q '^CONFIG_PACKAGE_kmod-nft-tproxy=y$' .config
+          grep -q '^CONFIG_KERNEL_ZRAM_BACKEND_LZO=y$' .config
+          grep -q '^CONFIG_KERNEL_ZRAM_BACKEND_ZSTD=y$' .config
           grep -q '^CONFIG_KERNEL_ZRAM_DEF_COMP_ZSTD=y$' .config
 
           if grep -q '^CONFIG_PACKAGE_luci-app-openclash=y$' .config; then
