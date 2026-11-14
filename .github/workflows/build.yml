@@ -7,6 +7,10 @@ on:
     paths:
       - ".github/workflows/build.yml"
       - "config/**"
+  pull_request:
+    paths:
+      - ".github/workflows/build.yml"
+      - "config/**"
 
 permissions:
   contents: read
@@ -124,6 +128,11 @@ jobs:
           CONFIG_PACKAGE_luci=y
           CONFIG_PACKAGE_kmod-zram=y
           CONFIG_PACKAGE_zram-swap=y
+
+          # OpenClash runtime kernel dependencies; build as ABI-matched kmods.
+          CONFIG_PACKAGE_kmod-inet-diag=m
+          CONFIG_PACKAGE_kmod-nft-tproxy=m
+          CONFIG_PACKAGE_kmod-tun=m
           EOF
 
           # OpenWrt top-level kernel options, not raw Linux Kconfig entries.
@@ -138,6 +147,13 @@ jobs:
           grep -q '^CONFIG_TARGET_mediatek_filogic_DEVICE_xiaomi_mi-router-ax3000t=y$' .config
           grep -q '^CONFIG_PACKAGE_kmod-zram=y$' .config
           grep -q '^CONFIG_PACKAGE_zram-swap=y$' .config
+
+          for pkg in kmod-inet-diag kmod-nft-tproxy kmod-tun; do
+            grep -q "^CONFIG_PACKAGE_${pkg}=m$" .config || {
+              echo "ERROR: ${pkg} is not selected as a module"
+              exit 1
+            }
+          done
           grep -q '^CONFIG_KERNEL_ZRAM_BACKEND_LZO=y$' .config
           grep -q '^CONFIG_KERNEL_ZRAM_BACKEND_ZSTD=y$' .config
           grep -q '^CONFIG_KERNEL_ZRAM_DEF_COMP_ZSTD=y$' .config
@@ -224,6 +240,30 @@ jobs:
             exit 1
           }
 
+          # Verify the kernel features required by OpenClash are loadable modules.
+          for symbol in INET_DIAG NFT_TPROXY TUN; do
+            grep -q "^CONFIG_${symbol}=m$" "$KCFG" || {
+              echo "ERROR: CONFIG_${symbol} is not built as a module"
+              grep -E "^CONFIG_${symbol}=" "$KCFG" || true
+              exit 1
+            }
+          done
+
+          # Kernel modules must be present in this build's target kmods repository.
+          KMOD_DIR="bin/targets/mediatek/filogic/kmods"
+          if [ ! -d "$KMOD_DIR" ]; then
+            echo "ERROR: kmods output directory not found: $KMOD_DIR"
+            exit 1
+          fi
+          for pkg in kmod-inet-diag kmod-nft-tproxy kmod-tun; do
+            APK="$(find "$KMOD_DIR" -type f -name "${pkg}*.apk" -print -quit)"
+            if [ -z "$APK" ]; then
+              echo "ERROR: ${pkg} APK was not generated under $KMOD_DIR"
+              exit 1
+            fi
+            echo "Found ${pkg}: $APK"
+          done
+
           echo "Verified kernel config: $KCFG"
           grep -E '^CONFIG_ZRAM(=|_)' "$KCFG"
 
@@ -279,6 +319,7 @@ jobs:
           name: immortalwrt-ax3000t-zram-zstd-${{ github.run_number }}
           path: |
             immortalwrt/bin/targets/mediatek/filogic/*xiaomi_mi-router-ax3000t*
+            immortalwrt/bin/targets/mediatek/filogic/kmods/**
             immortalwrt/bin/targets/mediatek/filogic/ax3000t-kernel.config
             immortalwrt/bin/targets/mediatek/filogic/ax3000t-build.config
             immortalwrt/bin/targets/mediatek/filogic/ax3000t-build-info.txt
