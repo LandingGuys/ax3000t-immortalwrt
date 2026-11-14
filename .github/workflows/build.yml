@@ -124,6 +124,11 @@ jobs:
           CONFIG_PACKAGE_luci=y
           CONFIG_PACKAGE_kmod-zram=y
           CONFIG_PACKAGE_zram-swap=y
+
+          # OpenClash runtime kernel dependencies; build as matching kmods.
+          CONFIG_PACKAGE_kmod-inet-diag=m
+          CONFIG_PACKAGE_kmod-nft-tproxy=m
+          CONFIG_PACKAGE_kmod-tun=m
           EOF
 
           # OpenWrt top-level kernel options, not raw Linux Kconfig entries.
@@ -137,8 +142,768 @@ jobs:
 
           grep -q '^CONFIG_TARGET_mediatek_filogic_DEVICE_xiaomi_mi-router-ax3000t=y$' .config
           grep -q '^CONFIG_PACKAGE_kmod-zram=y$' .config
-          grep -q '^CONFIG_PACKAGE_zram-swap=y$' .config
-          grep -q '^CONFIG_KERNEL_ZRAM_BACKEND_LZO=y$' .config
+          grep -q '^CONFIG_PACKAGE_zram-swap=y
+          grep -q '^CONFIG_KERNEL_ZRAM_BACKEND_ZSTD=y$' .config
+          grep -q '^CONFIG_KERNEL_ZRAM_DEF_COMP_ZSTD=y$' .config
+
+          if grep -q '^CONFIG_PACKAGE_luci-app-openclash=y$' .config; then
+            echo "ERROR: OpenClash must not be included in this minimal build"
+            exit 1
+          fi
+
+      - name: Download package sources
+        working-directory: immortalwrt
+        shell: bash
+        run: |
+          set -o pipefail
+          echo "Build jobs: ${BUILD_JOBS}"
+          echo "===== DISK BEFORE DOWNLOAD ====="
+          df -hT
+          df -i
+
+          if ! make download -j"${BUILD_JOBS}" 2>&1 | tee ../download.log; then
+            echo "Parallel download failed; retrying single-threaded with verbose output..."
+            make download -j1 V=s 2>&1 | tee -a ../download.log
+          fi
+
+          echo "===== DISK AFTER DOWNLOAD ====="
+          df -hT
+          df -i
+
+      - name: Build firmware
+        working-directory: immortalwrt
+        shell: bash
+        run: |
+          set -o pipefail
+          echo "Build jobs: ${BUILD_JOBS}"
+          echo "===== RESOURCES BEFORE BUILD ====="
+          nproc
+          free -h
+          df -hT
+          df -i
+
+          if ! make -j"${BUILD_JOBS}" 2>&1 | tee ../build.log; then
+            echo "Parallel build failed; retrying single-threaded with verbose output..."
+            make -j1 V=s 2>&1 | tee -a ../build.log
+          fi
+
+          echo "===== RESOURCES AFTER BUILD ====="
+          free -h
+          df -hT
+          df -i
+
+      - name: Verify kernel configuration and image profile
+        working-directory: immortalwrt
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Checking generated kernel config..."
+
+          mapfile -t KERNEL_CONFIGS < <(
+            find build_dir -type f \
+              -path '*/linux-mediatek_filogic/linux-*/.config' -print
+          )
+
+          if [ "${#KERNEL_CONFIGS[@]}" -ne 1 ]; then
+            echo "ERROR: expected exactly one Filogic kernel .config, found ${#KERNEL_CONFIGS[@]}"
+            printf '%s\n' "${KERNEL_CONFIGS[@]}"
+            exit 1
+          fi
+
+          KCFG="${KERNEL_CONFIGS[0]}"
+          grep -q '^CONFIG_ZRAM=m$' "$KCFG" || {
+            echo "ERROR: CONFIG_ZRAM is not built as a module"
+            exit 1
+          }
+          grep -q '^CONFIG_ZRAM_BACKEND_LZO=y$' "$KCFG" || {
+            echo "ERROR: CONFIG_ZRAM_BACKEND_LZO is not enabled"
+            exit 1
+          }
+          grep -q '^CONFIG_ZRAM_BACKEND_ZSTD=y$' "$KCFG" || {
+            echo "ERROR: CONFIG_ZRAM_BACKEND_ZSTD is not enabled"
+            exit 1
+          }
+          grep -q '^CONFIG_ZRAM_DEF_COMP_ZSTD=y
+
+          IMAGE_DIR="bin/targets/mediatek/filogic"
+          mkdir -p "$IMAGE_DIR"
+          find "$IMAGE_DIR" -maxdepth 1 -type f \
+            -name '*xiaomi_mi-router-ax3000t*' -print
+
+          IMAGE="$(find "$IMAGE_DIR" -maxdepth 1 -type f \
+            -name '*xiaomi_mi-router-ax3000t*squashfs-sysupgrade.bin' \
+            -print -quit)"
+
+          if [ -z "$IMAGE" ]; then
+            echo "ERROR: ordinary AX3000T sysupgrade image not found"
+            exit 1
+          fi
+
+          echo "Selected image: $IMAGE"
+          sha256sum "$IMAGE" | tee "$IMAGE.sha256"
+          cp "$KCFG" "$IMAGE_DIR/ax3000t-kernel.config"
+          cp .config "$IMAGE_DIR/ax3000t-build.config"
+
+          SOURCE_COMMIT="$(git rev-parse HEAD)"
+          IMAGE_SIZE="$(stat -c '%s' "$IMAGE")"
+          IMAGE_SHA256="$(sha256sum "$IMAGE" | awk '{print $1}')"
+          BUILD_STARTED="$(cat ../build-start-utc.txt)"
+          BUILD_FINISHED="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+          {
+            echo "Device: Xiaomi Mi Router AX3000T"
+            echo "Target: mediatek/filogic"
+            echo "ImmortalWrt ref: ${IMMORTALWRT_REF}"
+            echo "Source commit: ${SOURCE_COMMIT}"
+            echo "Build started (UTC): ${BUILD_STARTED}"
+            echo "Build finished (UTC): ${BUILD_FINISHED}"
+            echo "Build jobs: ${BUILD_JOBS}"
+            echo "ZRAM: module"
+            echo "ZRAM backends: LZO, ZSTD"
+            echo "ZRAM default compressor: ZSTD"
+            echo "OpenClash: disabled"
+            echo "Image: $(basename "$IMAGE")"
+            echo "Image size (bytes): ${IMAGE_SIZE}"
+            echo "Image SHA256: ${IMAGE_SHA256}"
+          } > "$IMAGE_DIR/ax3000t-build-info.txt"
+
+          cp ../feeds-revisions.txt "$IMAGE_DIR/ax3000t-feeds-revisions.txt"
+          echo "===== BUILD INFO ====="
+          cat "$IMAGE_DIR/ax3000t-build-info.txt"
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-ax3000t-zram-zstd-${{ github.run_number }}
+          path: |
+            immortalwrt/bin/targets/mediatek/filogic/*xiaomi_mi-router-ax3000t*
+            immortalwrt/bin/targets/mediatek/filogic/kmods/**
+            immortalwrt/bin/targets/mediatek/filogic/ax3000t-kernel.config
+            immortalwrt/bin/targets/mediatek/filogic/ax3000t-build.config
+            immortalwrt/bin/targets/mediatek/filogic/ax3000t-build-info.txt
+            immortalwrt/bin/targets/mediatek/filogic/ax3000t-feeds-revisions.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-ax3000t-diagnostics-${{ github.run_number }}
+          path: |
+            download.log
+            build.log
+            feeds-revisions.txt
+            build-start-utc.txt
+            immortalwrt/.config
+            immortalwrt/build_dir/**/linux-mediatek_filogic/linux-*/.config
+          if-no-files-found: warn
+          retention-days: 7
+ .config
+          for pkg in kmod-inet-diag kmod-nft-tproxy kmod-tun; do
+            grep -q "^CONFIG_PACKAGE_${pkg}=m$" .config || {
+              echo "ERROR: ${pkg} is not selected as a module"
+              exit 1
+            }
+          done
+          grep -q '^CONFIG_KERNEL_ZRAM_BACKEND_LZO=y
+          grep -q '^CONFIG_KERNEL_ZRAM_BACKEND_ZSTD=y$' .config
+          grep -q '^CONFIG_KERNEL_ZRAM_DEF_COMP_ZSTD=y$' .config
+
+          if grep -q '^CONFIG_PACKAGE_luci-app-openclash=y$' .config; then
+            echo "ERROR: OpenClash must not be included in this minimal build"
+            exit 1
+          fi
+
+      - name: Download package sources
+        working-directory: immortalwrt
+        shell: bash
+        run: |
+          set -o pipefail
+          echo "Build jobs: ${BUILD_JOBS}"
+          echo "===== DISK BEFORE DOWNLOAD ====="
+          df -hT
+          df -i
+
+          if ! make download -j"${BUILD_JOBS}" 2>&1 | tee ../download.log; then
+            echo "Parallel download failed; retrying single-threaded with verbose output..."
+            make download -j1 V=s 2>&1 | tee -a ../download.log
+          fi
+
+          echo "===== DISK AFTER DOWNLOAD ====="
+          df -hT
+          df -i
+
+      - name: Build firmware
+        working-directory: immortalwrt
+        shell: bash
+        run: |
+          set -o pipefail
+          echo "Build jobs: ${BUILD_JOBS}"
+          echo "===== RESOURCES BEFORE BUILD ====="
+          nproc
+          free -h
+          df -hT
+          df -i
+
+          if ! make -j"${BUILD_JOBS}" 2>&1 | tee ../build.log; then
+            echo "Parallel build failed; retrying single-threaded with verbose output..."
+            make -j1 V=s 2>&1 | tee -a ../build.log
+          fi
+
+          echo "===== RESOURCES AFTER BUILD ====="
+          free -h
+          df -hT
+          df -i
+
+      - name: Verify kernel configuration and image profile
+        working-directory: immortalwrt
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Checking generated kernel config..."
+
+          mapfile -t KERNEL_CONFIGS < <(
+            find build_dir -type f \
+              -path '*/linux-mediatek_filogic/linux-*/.config' -print
+          )
+
+          if [ "${#KERNEL_CONFIGS[@]}" -ne 1 ]; then
+            echo "ERROR: expected exactly one Filogic kernel .config, found ${#KERNEL_CONFIGS[@]}"
+            printf '%s\n' "${KERNEL_CONFIGS[@]}"
+            exit 1
+          fi
+
+          KCFG="${KERNEL_CONFIGS[0]}"
+          grep -q '^CONFIG_ZRAM=m$' "$KCFG" || {
+            echo "ERROR: CONFIG_ZRAM is not built as a module"
+            exit 1
+          }
+          grep -q '^CONFIG_ZRAM_BACKEND_LZO=y$' "$KCFG" || {
+            echo "ERROR: CONFIG_ZRAM_BACKEND_LZO is not enabled"
+            exit 1
+          }
+          grep -q '^CONFIG_ZRAM_BACKEND_ZSTD=y$' "$KCFG" || {
+            echo "ERROR: CONFIG_ZRAM_BACKEND_ZSTD is not enabled"
+            exit 1
+          }
+          grep -q '^CONFIG_ZRAM_DEF_COMP_ZSTD=y$' "$KCFG" || {
+            echo "ERROR: ZSTD is not the default ZRAM compressor"
+            exit 1
+          }
+
+          echo "Verified kernel config: $KCFG"
+          grep -E '^CONFIG_ZRAM(=|_)' "$KCFG"
+
+          IMAGE_DIR="bin/targets/mediatek/filogic"
+          mkdir -p "$IMAGE_DIR"
+          find "$IMAGE_DIR" -maxdepth 1 -type f \
+            -name '*xiaomi_mi-router-ax3000t*' -print
+
+          IMAGE="$(find "$IMAGE_DIR" -maxdepth 1 -type f \
+            -name '*xiaomi_mi-router-ax3000t*squashfs-sysupgrade.bin' \
+            -print -quit)"
+
+          if [ -z "$IMAGE" ]; then
+            echo "ERROR: ordinary AX3000T sysupgrade image not found"
+            exit 1
+          fi
+
+          echo "Selected image: $IMAGE"
+          sha256sum "$IMAGE" | tee "$IMAGE.sha256"
+          cp "$KCFG" "$IMAGE_DIR/ax3000t-kernel.config"
+          cp .config "$IMAGE_DIR/ax3000t-build.config"
+
+          SOURCE_COMMIT="$(git rev-parse HEAD)"
+          IMAGE_SIZE="$(stat -c '%s' "$IMAGE")"
+          IMAGE_SHA256="$(sha256sum "$IMAGE" | awk '{print $1}')"
+          BUILD_STARTED="$(cat ../build-start-utc.txt)"
+          BUILD_FINISHED="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+          {
+            echo "Device: Xiaomi Mi Router AX3000T"
+            echo "Target: mediatek/filogic"
+            echo "ImmortalWrt ref: ${IMMORTALWRT_REF}"
+            echo "Source commit: ${SOURCE_COMMIT}"
+            echo "Build started (UTC): ${BUILD_STARTED}"
+            echo "Build finished (UTC): ${BUILD_FINISHED}"
+            echo "Build jobs: ${BUILD_JOBS}"
+            echo "ZRAM: module"
+            echo "ZRAM backends: LZO, ZSTD"
+            echo "ZRAM default compressor: ZSTD"
+            echo "OpenClash: disabled"
+            echo "Image: $(basename "$IMAGE")"
+            echo "Image size (bytes): ${IMAGE_SIZE}"
+            echo "Image SHA256: ${IMAGE_SHA256}"
+          } > "$IMAGE_DIR/ax3000t-build-info.txt"
+
+          cp ../feeds-revisions.txt "$IMAGE_DIR/ax3000t-feeds-revisions.txt"
+          echo "===== BUILD INFO ====="
+          cat "$IMAGE_DIR/ax3000t-build-info.txt"
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-ax3000t-zram-zstd-${{ github.run_number }}
+          path: |
+            immortalwrt/bin/targets/mediatek/filogic/*xiaomi_mi-router-ax3000t*
+            immortalwrt/bin/targets/mediatek/filogic/ax3000t-kernel.config
+            immortalwrt/bin/targets/mediatek/filogic/ax3000t-build.config
+            immortalwrt/bin/targets/mediatek/filogic/ax3000t-build-info.txt
+            immortalwrt/bin/targets/mediatek/filogic/ax3000t-feeds-revisions.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-ax3000t-diagnostics-${{ github.run_number }}
+          path: |
+            download.log
+            build.log
+            feeds-revisions.txt
+            build-start-utc.txt
+            immortalwrt/.config
+            immortalwrt/build_dir/**/linux-mediatek_filogic/linux-*/.config
+          if-no-files-found: warn
+          retention-days: 7
+ .config
+          grep -q '^CONFIG_KERNEL_ZRAM_BACKEND_ZSTD=y$' .config
+          grep -q '^CONFIG_KERNEL_ZRAM_DEF_COMP_ZSTD=y$' .config
+
+          if grep -q '^CONFIG_PACKAGE_luci-app-openclash=y$' .config; then
+            echo "ERROR: OpenClash must not be included in this minimal build"
+            exit 1
+          fi
+
+      - name: Download package sources
+        working-directory: immortalwrt
+        shell: bash
+        run: |
+          set -o pipefail
+          echo "Build jobs: ${BUILD_JOBS}"
+          echo "===== DISK BEFORE DOWNLOAD ====="
+          df -hT
+          df -i
+
+          if ! make download -j"${BUILD_JOBS}" 2>&1 | tee ../download.log; then
+            echo "Parallel download failed; retrying single-threaded with verbose output..."
+            make download -j1 V=s 2>&1 | tee -a ../download.log
+          fi
+
+          echo "===== DISK AFTER DOWNLOAD ====="
+          df -hT
+          df -i
+
+      - name: Build firmware
+        working-directory: immortalwrt
+        shell: bash
+        run: |
+          set -o pipefail
+          echo "Build jobs: ${BUILD_JOBS}"
+          echo "===== RESOURCES BEFORE BUILD ====="
+          nproc
+          free -h
+          df -hT
+          df -i
+
+          if ! make -j"${BUILD_JOBS}" 2>&1 | tee ../build.log; then
+            echo "Parallel build failed; retrying single-threaded with verbose output..."
+            make -j1 V=s 2>&1 | tee -a ../build.log
+          fi
+
+          echo "===== RESOURCES AFTER BUILD ====="
+          free -h
+          df -hT
+          df -i
+
+      - name: Verify kernel configuration and image profile
+        working-directory: immortalwrt
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Checking generated kernel config..."
+
+          mapfile -t KERNEL_CONFIGS < <(
+            find build_dir -type f \
+              -path '*/linux-mediatek_filogic/linux-*/.config' -print
+          )
+
+          if [ "${#KERNEL_CONFIGS[@]}" -ne 1 ]; then
+            echo "ERROR: expected exactly one Filogic kernel .config, found ${#KERNEL_CONFIGS[@]}"
+            printf '%s\n' "${KERNEL_CONFIGS[@]}"
+            exit 1
+          fi
+
+          KCFG="${KERNEL_CONFIGS[0]}"
+          grep -q '^CONFIG_ZRAM=m$' "$KCFG" || {
+            echo "ERROR: CONFIG_ZRAM is not built as a module"
+            exit 1
+          }
+          grep -q '^CONFIG_ZRAM_BACKEND_LZO=y$' "$KCFG" || {
+            echo "ERROR: CONFIG_ZRAM_BACKEND_LZO is not enabled"
+            exit 1
+          }
+          grep -q '^CONFIG_ZRAM_BACKEND_ZSTD=y$' "$KCFG" || {
+            echo "ERROR: CONFIG_ZRAM_BACKEND_ZSTD is not enabled"
+            exit 1
+          }
+          grep -q '^CONFIG_ZRAM_DEF_COMP_ZSTD=y$' "$KCFG" || {
+            echo "ERROR: ZSTD is not the default ZRAM compressor"
+            exit 1
+          }
+
+          echo "Verified kernel config: $KCFG"
+          grep -E '^CONFIG_ZRAM(=|_)' "$KCFG"
+
+          IMAGE_DIR="bin/targets/mediatek/filogic"
+          mkdir -p "$IMAGE_DIR"
+          find "$IMAGE_DIR" -maxdepth 1 -type f \
+            -name '*xiaomi_mi-router-ax3000t*' -print
+
+          IMAGE="$(find "$IMAGE_DIR" -maxdepth 1 -type f \
+            -name '*xiaomi_mi-router-ax3000t*squashfs-sysupgrade.bin' \
+            -print -quit)"
+
+          if [ -z "$IMAGE" ]; then
+            echo "ERROR: ordinary AX3000T sysupgrade image not found"
+            exit 1
+          fi
+
+          echo "Selected image: $IMAGE"
+          sha256sum "$IMAGE" | tee "$IMAGE.sha256"
+          cp "$KCFG" "$IMAGE_DIR/ax3000t-kernel.config"
+          cp .config "$IMAGE_DIR/ax3000t-build.config"
+
+          SOURCE_COMMIT="$(git rev-parse HEAD)"
+          IMAGE_SIZE="$(stat -c '%s' "$IMAGE")"
+          IMAGE_SHA256="$(sha256sum "$IMAGE" | awk '{print $1}')"
+          BUILD_STARTED="$(cat ../build-start-utc.txt)"
+          BUILD_FINISHED="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+          {
+            echo "Device: Xiaomi Mi Router AX3000T"
+            echo "Target: mediatek/filogic"
+            echo "ImmortalWrt ref: ${IMMORTALWRT_REF}"
+            echo "Source commit: ${SOURCE_COMMIT}"
+            echo "Build started (UTC): ${BUILD_STARTED}"
+            echo "Build finished (UTC): ${BUILD_FINISHED}"
+            echo "Build jobs: ${BUILD_JOBS}"
+            echo "ZRAM: module"
+            echo "ZRAM backends: LZO, ZSTD"
+            echo "ZRAM default compressor: ZSTD"
+            echo "OpenClash: disabled"
+            echo "Image: $(basename "$IMAGE")"
+            echo "Image size (bytes): ${IMAGE_SIZE}"
+            echo "Image SHA256: ${IMAGE_SHA256}"
+          } > "$IMAGE_DIR/ax3000t-build-info.txt"
+
+          cp ../feeds-revisions.txt "$IMAGE_DIR/ax3000t-feeds-revisions.txt"
+          echo "===== BUILD INFO ====="
+          cat "$IMAGE_DIR/ax3000t-build-info.txt"
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-ax3000t-zram-zstd-${{ github.run_number }}
+          path: |
+            immortalwrt/bin/targets/mediatek/filogic/*xiaomi_mi-router-ax3000t*
+            immortalwrt/bin/targets/mediatek/filogic/ax3000t-kernel.config
+            immortalwrt/bin/targets/mediatek/filogic/ax3000t-build.config
+            immortalwrt/bin/targets/mediatek/filogic/ax3000t-build-info.txt
+            immortalwrt/bin/targets/mediatek/filogic/ax3000t-feeds-revisions.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-ax3000t-diagnostics-${{ github.run_number }}
+          path: |
+            download.log
+            build.log
+            feeds-revisions.txt
+            build-start-utc.txt
+            immortalwrt/.config
+            immortalwrt/build_dir/**/linux-mediatek_filogic/linux-*/.config
+          if-no-files-found: warn
+          retention-days: 7
+ "$KCFG" || {
+            echo "ERROR: ZSTD is not the default ZRAM compressor"
+            exit 1
+          }
+
+          # Verify the kernel features required by OpenClash are modules.
+          for symbol in INET_DIAG NFT_TPROXY TUN; do
+            grep -q "^CONFIG_${symbol}=m$" "$KCFG" || {
+              echo "ERROR: CONFIG_${symbol} is not built as a module"
+              grep -E "^CONFIG_${symbol}=" "$KCFG" || true
+              exit 1
+            }
+          done
+
+          echo "Verified kernel config: $KCFG"
+          grep -E '^CONFIG_ZRAM(=|_)|^CONFIG_(INET_DIAG|NFT_TPROXY|TUN)=' "$KCFG"
+
+          # Confirm all three ABI-matched kmod APKs were actually produced.
+          KMOD_DIR="bin/targets/mediatek/filogic/kmods"
+          if [ ! -d "$KMOD_DIR" ]; then
+            echo "ERROR: kmods output directory not found: $KMOD_DIR"
+            exit 1
+          fi
+          for pkg in kmod-inet-diag kmod-nft-tproxy kmod-tun; do
+            if ! find "$KMOD_DIR" -type f -name "${pkg}*.apk" -print -quit | grep -q .; then
+              echo "ERROR: ${pkg} APK was not generated under $KMOD_DIR"
+              exit 1
+            fi
+            find "$KMOD_DIR" -type f -name "${pkg}*.apk" -print
+          done
+
+          IMAGE_DIR="bin/targets/mediatek/filogic"
+          mkdir -p "$IMAGE_DIR"
+          find "$IMAGE_DIR" -maxdepth 1 -type f \
+            -name '*xiaomi_mi-router-ax3000t*' -print
+
+          IMAGE="$(find "$IMAGE_DIR" -maxdepth 1 -type f \
+            -name '*xiaomi_mi-router-ax3000t*squashfs-sysupgrade.bin' \
+            -print -quit)"
+
+          if [ -z "$IMAGE" ]; then
+            echo "ERROR: ordinary AX3000T sysupgrade image not found"
+            exit 1
+          fi
+
+          echo "Selected image: $IMAGE"
+          sha256sum "$IMAGE" | tee "$IMAGE.sha256"
+          cp "$KCFG" "$IMAGE_DIR/ax3000t-kernel.config"
+          cp .config "$IMAGE_DIR/ax3000t-build.config"
+
+          SOURCE_COMMIT="$(git rev-parse HEAD)"
+          IMAGE_SIZE="$(stat -c '%s' "$IMAGE")"
+          IMAGE_SHA256="$(sha256sum "$IMAGE" | awk '{print $1}')"
+          BUILD_STARTED="$(cat ../build-start-utc.txt)"
+          BUILD_FINISHED="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+          {
+            echo "Device: Xiaomi Mi Router AX3000T"
+            echo "Target: mediatek/filogic"
+            echo "ImmortalWrt ref: ${IMMORTALWRT_REF}"
+            echo "Source commit: ${SOURCE_COMMIT}"
+            echo "Build started (UTC): ${BUILD_STARTED}"
+            echo "Build finished (UTC): ${BUILD_FINISHED}"
+            echo "Build jobs: ${BUILD_JOBS}"
+            echo "ZRAM: module"
+            echo "ZRAM backends: LZO, ZSTD"
+            echo "ZRAM default compressor: ZSTD"
+            echo "OpenClash: disabled"
+            echo "Image: $(basename "$IMAGE")"
+            echo "Image size (bytes): ${IMAGE_SIZE}"
+            echo "Image SHA256: ${IMAGE_SHA256}"
+          } > "$IMAGE_DIR/ax3000t-build-info.txt"
+
+          cp ../feeds-revisions.txt "$IMAGE_DIR/ax3000t-feeds-revisions.txt"
+          echo "===== BUILD INFO ====="
+          cat "$IMAGE_DIR/ax3000t-build-info.txt"
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-ax3000t-zram-zstd-${{ github.run_number }}
+          path: |
+            immortalwrt/bin/targets/mediatek/filogic/*xiaomi_mi-router-ax3000t*
+            immortalwrt/bin/targets/mediatek/filogic/ax3000t-kernel.config
+            immortalwrt/bin/targets/mediatek/filogic/ax3000t-build.config
+            immortalwrt/bin/targets/mediatek/filogic/ax3000t-build-info.txt
+            immortalwrt/bin/targets/mediatek/filogic/ax3000t-feeds-revisions.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-ax3000t-diagnostics-${{ github.run_number }}
+          path: |
+            download.log
+            build.log
+            feeds-revisions.txt
+            build-start-utc.txt
+            immortalwrt/.config
+            immortalwrt/build_dir/**/linux-mediatek_filogic/linux-*/.config
+          if-no-files-found: warn
+          retention-days: 7
+ .config
+          for pkg in kmod-inet-diag kmod-nft-tproxy kmod-tun; do
+            grep -q "^CONFIG_PACKAGE_${pkg}=m$" .config || {
+              echo "ERROR: ${pkg} is not selected as a module"
+              exit 1
+            }
+          done
+          grep -q '^CONFIG_KERNEL_ZRAM_BACKEND_LZO=y
+          grep -q '^CONFIG_KERNEL_ZRAM_BACKEND_ZSTD=y$' .config
+          grep -q '^CONFIG_KERNEL_ZRAM_DEF_COMP_ZSTD=y$' .config
+
+          if grep -q '^CONFIG_PACKAGE_luci-app-openclash=y$' .config; then
+            echo "ERROR: OpenClash must not be included in this minimal build"
+            exit 1
+          fi
+
+      - name: Download package sources
+        working-directory: immortalwrt
+        shell: bash
+        run: |
+          set -o pipefail
+          echo "Build jobs: ${BUILD_JOBS}"
+          echo "===== DISK BEFORE DOWNLOAD ====="
+          df -hT
+          df -i
+
+          if ! make download -j"${BUILD_JOBS}" 2>&1 | tee ../download.log; then
+            echo "Parallel download failed; retrying single-threaded with verbose output..."
+            make download -j1 V=s 2>&1 | tee -a ../download.log
+          fi
+
+          echo "===== DISK AFTER DOWNLOAD ====="
+          df -hT
+          df -i
+
+      - name: Build firmware
+        working-directory: immortalwrt
+        shell: bash
+        run: |
+          set -o pipefail
+          echo "Build jobs: ${BUILD_JOBS}"
+          echo "===== RESOURCES BEFORE BUILD ====="
+          nproc
+          free -h
+          df -hT
+          df -i
+
+          if ! make -j"${BUILD_JOBS}" 2>&1 | tee ../build.log; then
+            echo "Parallel build failed; retrying single-threaded with verbose output..."
+            make -j1 V=s 2>&1 | tee -a ../build.log
+          fi
+
+          echo "===== RESOURCES AFTER BUILD ====="
+          free -h
+          df -hT
+          df -i
+
+      - name: Verify kernel configuration and image profile
+        working-directory: immortalwrt
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Checking generated kernel config..."
+
+          mapfile -t KERNEL_CONFIGS < <(
+            find build_dir -type f \
+              -path '*/linux-mediatek_filogic/linux-*/.config' -print
+          )
+
+          if [ "${#KERNEL_CONFIGS[@]}" -ne 1 ]; then
+            echo "ERROR: expected exactly one Filogic kernel .config, found ${#KERNEL_CONFIGS[@]}"
+            printf '%s\n' "${KERNEL_CONFIGS[@]}"
+            exit 1
+          fi
+
+          KCFG="${KERNEL_CONFIGS[0]}"
+          grep -q '^CONFIG_ZRAM=m$' "$KCFG" || {
+            echo "ERROR: CONFIG_ZRAM is not built as a module"
+            exit 1
+          }
+          grep -q '^CONFIG_ZRAM_BACKEND_LZO=y$' "$KCFG" || {
+            echo "ERROR: CONFIG_ZRAM_BACKEND_LZO is not enabled"
+            exit 1
+          }
+          grep -q '^CONFIG_ZRAM_BACKEND_ZSTD=y$' "$KCFG" || {
+            echo "ERROR: CONFIG_ZRAM_BACKEND_ZSTD is not enabled"
+            exit 1
+          }
+          grep -q '^CONFIG_ZRAM_DEF_COMP_ZSTD=y$' "$KCFG" || {
+            echo "ERROR: ZSTD is not the default ZRAM compressor"
+            exit 1
+          }
+
+          echo "Verified kernel config: $KCFG"
+          grep -E '^CONFIG_ZRAM(=|_)' "$KCFG"
+
+          IMAGE_DIR="bin/targets/mediatek/filogic"
+          mkdir -p "$IMAGE_DIR"
+          find "$IMAGE_DIR" -maxdepth 1 -type f \
+            -name '*xiaomi_mi-router-ax3000t*' -print
+
+          IMAGE="$(find "$IMAGE_DIR" -maxdepth 1 -type f \
+            -name '*xiaomi_mi-router-ax3000t*squashfs-sysupgrade.bin' \
+            -print -quit)"
+
+          if [ -z "$IMAGE" ]; then
+            echo "ERROR: ordinary AX3000T sysupgrade image not found"
+            exit 1
+          fi
+
+          echo "Selected image: $IMAGE"
+          sha256sum "$IMAGE" | tee "$IMAGE.sha256"
+          cp "$KCFG" "$IMAGE_DIR/ax3000t-kernel.config"
+          cp .config "$IMAGE_DIR/ax3000t-build.config"
+
+          SOURCE_COMMIT="$(git rev-parse HEAD)"
+          IMAGE_SIZE="$(stat -c '%s' "$IMAGE")"
+          IMAGE_SHA256="$(sha256sum "$IMAGE" | awk '{print $1}')"
+          BUILD_STARTED="$(cat ../build-start-utc.txt)"
+          BUILD_FINISHED="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+          {
+            echo "Device: Xiaomi Mi Router AX3000T"
+            echo "Target: mediatek/filogic"
+            echo "ImmortalWrt ref: ${IMMORTALWRT_REF}"
+            echo "Source commit: ${SOURCE_COMMIT}"
+            echo "Build started (UTC): ${BUILD_STARTED}"
+            echo "Build finished (UTC): ${BUILD_FINISHED}"
+            echo "Build jobs: ${BUILD_JOBS}"
+            echo "ZRAM: module"
+            echo "ZRAM backends: LZO, ZSTD"
+            echo "ZRAM default compressor: ZSTD"
+            echo "OpenClash: disabled"
+            echo "Image: $(basename "$IMAGE")"
+            echo "Image size (bytes): ${IMAGE_SIZE}"
+            echo "Image SHA256: ${IMAGE_SHA256}"
+          } > "$IMAGE_DIR/ax3000t-build-info.txt"
+
+          cp ../feeds-revisions.txt "$IMAGE_DIR/ax3000t-feeds-revisions.txt"
+          echo "===== BUILD INFO ====="
+          cat "$IMAGE_DIR/ax3000t-build-info.txt"
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-ax3000t-zram-zstd-${{ github.run_number }}
+          path: |
+            immortalwrt/bin/targets/mediatek/filogic/*xiaomi_mi-router-ax3000t*
+            immortalwrt/bin/targets/mediatek/filogic/ax3000t-kernel.config
+            immortalwrt/bin/targets/mediatek/filogic/ax3000t-build.config
+            immortalwrt/bin/targets/mediatek/filogic/ax3000t-build-info.txt
+            immortalwrt/bin/targets/mediatek/filogic/ax3000t-feeds-revisions.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-ax3000t-diagnostics-${{ github.run_number }}
+          path: |
+            download.log
+            build.log
+            feeds-revisions.txt
+            build-start-utc.txt
+            immortalwrt/.config
+            immortalwrt/build_dir/**/linux-mediatek_filogic/linux-*/.config
+          if-no-files-found: warn
+          retention-days: 7
+ .config
           grep -q '^CONFIG_KERNEL_ZRAM_BACKEND_ZSTD=y$' .config
           grep -q '^CONFIG_KERNEL_ZRAM_DEF_COMP_ZSTD=y$' .config
 
