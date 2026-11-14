@@ -25,38 +25,98 @@ jobs:
       OPENCLASH_FEED: https://github.com/vernesong/OpenClash.git
 
     steps:
+      # ==========================================
+      # 1. Runner 磁盘清理
+      # ==========================================
+      - name: Free Runner Disk Space
+        run: |
+          echo "===== DISK BEFORE CLEANUP ====="
+          df -h
+          df -i
+
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/powershell
+          sudo rm -rf /usr/share/swift
+
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+          sudo docker system prune -af || true
+
+          echo "===== DISK AFTER CLEANUP ====="
+          df -h
+          df -i
+
+      # ==========================================
+      # 2. Checkout
+      # ==========================================
       - name: Checkout build configuration
         uses: actions/checkout@v4
 
+      # ==========================================
+      # 3. 安装编译依赖
+      # ==========================================
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+
+          sudo apt-get install -y --no-install-recommends \
             build-essential clang flex bison g++ gawk gcc-multilib \
             gettext git libncurses-dev libssl-dev python3-setuptools \
             rsync swig unzip zlib1g-dev file wget curl zstd
 
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+          echo "===== DISK AFTER DEPENDENCIES ====="
+          df -h
+          df -i
+
+      # ==========================================
+      # 4. 下载 ImmortalWrt 源码
+      # ==========================================
       - name: Clone ImmortalWrt source
         run: |
-          git clone https://github.com/immortalwrt/immortalwrt.git immortalwrt
+          git clone --depth 1 \
+            --branch "${IMMORTALWRT_REF}" \
+            https://github.com/immortalwrt/immortalwrt.git immortalwrt
+
           cd immortalwrt
-          git fetch --tags --force
-          git checkout --detach "${IMMORTALWRT_REF}"
+
           echo "Source commit: $(git rev-parse HEAD)"
           git log -1 --oneline
 
+          echo "===== DISK AFTER SOURCE ====="
+          df -h
+          df -i
+
+      # ==========================================
+      # 5. OpenClash Feed
+      # ==========================================
       - name: Add OpenClash feed
         working-directory: immortalwrt
         run: |
           echo "src-git openclash ${OPENCLASH_FEED}" >> feeds.conf.default
+
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
+          echo "===== DISK AFTER FEEDS ====="
+          df -h
+          df -i
+
+      # ==========================================
+      # 6. AX3000T + ZRAM 配置
+      # ==========================================
       - name: Configure AX3000T and ZRAM
         working-directory: immortalwrt
         run: |
           set -eux
+
           test -f target/linux/generic/config-6.12
+
           cat > .config <<'EOF'
           CONFIG_TARGET_mediatek=y
           CONFIG_TARGET_mediatek_filogic=y
@@ -70,66 +130,106 @@ jobs:
           EOF
 
           cat ../config/zram.config >> target/linux/generic/config-6.12
+
           make defconfig
 
           grep -q '^CONFIG_TARGET_mediatek_filogic_DEVICE_xiaomi_mi-router-ax3000t=y$' .config
           grep -q '^CONFIG_PACKAGE_kmod-zram=y$' .config
           grep -q '^CONFIG_PACKAGE_luci-app-openclash=y$' .config
 
+      # ==========================================
+      # 7. 下载软件包源码
+      # ==========================================
       - name: Download package sources
         working-directory: immortalwrt
         run: |
-          make download -j"$(nproc)" V=s
+          make download -j"$(nproc)"
 
+          echo "===== DISK AFTER DOWNLOAD ====="
+          df -h
+          df -i
+
+      # ==========================================
+      # 8. 编译固件
+      # ==========================================
       - name: Build firmware
         working-directory: immortalwrt
         run: |
-          make -j"$(nproc)" V=s
+          echo "===== DISK BEFORE BUILD ====="
+          df -h
+          df -i
 
+          make -j"$(nproc)"
+
+          echo "===== DISK AFTER BUILD ====="
+          df -h
+          df -i
+
+      # ==========================================
+      # 9. 验证内核和固件
+      # ==========================================
       - name: Verify kernel configuration and image profile
         working-directory: immortalwrt
         shell: bash
         run: |
           set -euo pipefail
+
           echo "Checking generated kernel config..."
+
           mapfile -t KERNEL_CONFIGS < <(
             find build_dir -type f \
               -path '*/linux-mediatek_filogic/linux-*/.config' -print
           )
+
           if [ "${#KERNEL_CONFIGS[@]}" -eq 0 ]; then
             echo "ERROR: generated Filogic kernel .config not found"
             exit 1
           fi
 
           KCFG="${KERNEL_CONFIGS[0]}"
+
           grep -q '^CONFIG_ZRAM=m$' "$KCFG" || {
-            echo "ERROR: CONFIG_ZRAM is not built as a module"; exit 1;
+            echo "ERROR: CONFIG_ZRAM is not built as a module"
+            exit 1
           }
+
           grep -q '^CONFIG_ZRAM_BACKEND_LZO=y$' "$KCFG" || {
-            echo "ERROR: ZRAM LZO backend is not enabled"; exit 1;
+            echo "ERROR: CONFIG_ZRAM_BACKEND_LZO is not enabled"
+            exit 1
           }
+
           grep -q '^CONFIG_ZRAM_BACKEND_ZSTD=y$' "$KCFG" || {
-            echo "ERROR: ZRAM ZSTD backend is not enabled"; exit 1;
+            echo "ERROR: CONFIG_ZRAM_BACKEND_ZSTD is not enabled"
+            exit 1
           }
 
           echo "Verified kernel config: $KCFG"
           grep -E '^CONFIG_ZRAM(=|_)' "$KCFG"
 
           IMAGE_DIR="bin/targets/mediatek/filogic"
-          find "$IMAGE_DIR" -maxdepth 1 -type f -name '*xiaomi_mi-router-ax3000t*' -print
+
+          find "$IMAGE_DIR" -maxdepth 1 -type f \
+            -name '*xiaomi_mi-router-ax3000t*' -print
+
           IMAGE="$(find "$IMAGE_DIR" -maxdepth 1 -type f \
             -name '*xiaomi_mi-router-ax3000t*squashfs-sysupgrade.bin' \
             -print -quit)"
+
           if [ -z "$IMAGE" ]; then
             echo "ERROR: ordinary AX3000T sysupgrade image not found"
             exit 1
           fi
 
           echo "Selected image: $IMAGE"
+
           sha256sum "$IMAGE" | tee "$IMAGE.sha256"
+
           cp "$KCFG" "$IMAGE_DIR/ax3000t-kernel.config"
           cp .config "$IMAGE_DIR/ax3000t-build.config"
 
+      # ==========================================
+      # 10. 上传固件
+      # ==========================================
       - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
         with:
