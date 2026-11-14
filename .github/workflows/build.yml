@@ -22,7 +22,6 @@ jobs:
 
     env:
       IMMORTALWRT_REF: v25.12.2
-      OPENCLASH_FEED: https://github.com/vernesong/OpenClash.git
 
     steps:
       # ==========================================
@@ -93,13 +92,11 @@ jobs:
           df -i
 
       # ==========================================
-      # 5. OpenClash Feed
+      # 5. 更新并安装 ImmortalWrt 默认 feeds
       # ==========================================
-      - name: Add OpenClash feed
+      - name: Update and install feeds
         working-directory: immortalwrt
         run: |
-          echo "src-git openclash ${OPENCLASH_FEED}" >> feeds.conf.default
-
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
@@ -108,14 +105,12 @@ jobs:
           df -i
 
       # ==========================================
-      # 6. AX3000T + ZRAM 配置
+      # 6. AX3000T + ZRAM ZSTD 配置
       # ==========================================
-      - name: Configure AX3000T and ZRAM
+      - name: Configure AX3000T and ZRAM ZSTD
         working-directory: immortalwrt
         run: |
           set -eux
-
-          test -f target/linux/generic/config-6.12
 
           cat > .config <<'EOF'
           CONFIG_TARGET_mediatek=y
@@ -123,19 +118,33 @@ jobs:
           CONFIG_TARGET_mediatek_filogic_DEVICE_xiaomi_mi-router-ax3000t=y
 
           CONFIG_PACKAGE_luci=y
-          CONFIG_PACKAGE_luci-app-openclash=y
           CONFIG_PACKAGE_kmod-zram=y
           CONFIG_PACKAGE_zram-swap=y
-          CONFIG_PACKAGE_kmod-lib-zstd=y
           EOF
 
-          cat ../config/zram.config >> target/linux/generic/config-6.12
+          # Append OpenWrt top-level kernel options, not raw Linux Kconfig
+          # entries to target/linux/generic/config-6.12.
+          cat ../config/zram.config >> .config
 
           make defconfig
 
+          echo "===== TARGET CONFIG ====="
+          grep '^CONFIG_TARGET_mediatek_filogic_DEVICE_' .config
+
+          echo "===== ZRAM CONFIG ====="
+          grep -E '^CONFIG_(PACKAGE_(kmod-zram|zram-swap)|KERNEL_ZRAM_)' .config
+
           grep -q '^CONFIG_TARGET_mediatek_filogic_DEVICE_xiaomi_mi-router-ax3000t=y$' .config
           grep -q '^CONFIG_PACKAGE_kmod-zram=y$' .config
-          grep -q '^CONFIG_PACKAGE_luci-app-openclash=y$' .config
+          grep -q '^CONFIG_PACKAGE_zram-swap=y$' .config
+          grep -q '^CONFIG_KERNEL_ZRAM_BACKEND_LZO=y$' .config
+          grep -q '^CONFIG_KERNEL_ZRAM_BACKEND_ZSTD=y$' .config
+          grep -q '^CONFIG_KERNEL_ZRAM_DEF_COMP_ZSTD=y$' .config
+
+          if grep -q '^CONFIG_PACKAGE_luci-app-openclash=y$' .config; then
+            echo "ERROR: OpenClash must not be included in this minimal build"
+            exit 1
+          fi
 
       # ==========================================
       # 7. 下载软件包源码
@@ -200,6 +209,11 @@ jobs:
 
           grep -q '^CONFIG_ZRAM_BACKEND_ZSTD=y$' "$KCFG" || {
             echo "ERROR: CONFIG_ZRAM_BACKEND_ZSTD is not enabled"
+            exit 1
+          }
+
+          grep -q '^CONFIG_ZRAM_DEF_COMP_ZSTD=y$' "$KCFG" || {
+            echo "ERROR: ZSTD is not selected as the default ZRAM compressor"
             exit 1
           }
 
