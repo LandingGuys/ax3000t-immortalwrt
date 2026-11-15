@@ -249,20 +249,22 @@ jobs:
             }
           done
 
-          # Kernel modules must be present in this build's target kmods repository.
-          KMOD_DIR="bin/targets/mediatek/filogic/kmods"
-          if [ ! -d "$KMOD_DIR" ]; then
-            echo "ERROR: kmods output directory not found: $KMOD_DIR"
-            exit 1
-          fi
+          # Locate kernel-module APKs in the actual package output tree.
+          # ImmortalWrt APK builds may place package feeds under bin/packages,
+          # rather than bin/targets/<target>/<subtarget>/kmods.
           for pkg in kmod-inet-diag kmod-nft-tproxy kmod-tun; do
-            APK="$(find "$KMOD_DIR" -type f -name "${pkg}*.apk" -print -quit)"
+            APK="$(find bin -type f -name "${pkg}*.apk" -print -quit)"
             if [ -z "$APK" ]; then
-              echo "ERROR: ${pkg} APK was not generated under $KMOD_DIR"
+              echo "ERROR: ${pkg} APK was not generated anywhere under bin/"
+              echo "===== PACKAGE OUTPUT DIRECTORIES ====="
+              find bin -maxdepth 5 -type d -print | sort | head -300
               exit 1
             fi
             echo "Found ${pkg}: $APK"
           done
+
+          echo "===== KERNEL MODULE APK LOCATIONS ====="
+          find bin -type f \( -name 'kmod-inet-diag*.apk' -o -name 'kmod-nft-tproxy*.apk' -o -name 'kmod-tun*.apk' \) -print
 
           echo "Verified kernel config: $KCFG"
           grep -E '^CONFIG_ZRAM(=|_)' "$KCFG"
@@ -320,6 +322,7 @@ jobs:
           path: |
             immortalwrt/bin/targets/mediatek/filogic/*xiaomi_mi-router-ax3000t*
             immortalwrt/bin/targets/mediatek/filogic/kmods/**
+            immortalwrt/bin/packages/**
             immortalwrt/bin/targets/mediatek/filogic/ax3000t-kernel.config
             immortalwrt/bin/targets/mediatek/filogic/ax3000t-build.config
             immortalwrt/bin/targets/mediatek/filogic/ax3000t-build-info.txt
